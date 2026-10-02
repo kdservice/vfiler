@@ -230,6 +230,7 @@ class AppConfig:
 
 RUN_HISTORY_PATH = Path(__file__).resolve().with_name("vfiler_run.his")
 STAT_PATH = Path(__file__).resolve().with_name("vfiler_stat.json")
+STAT_LOCK_PATH = STAT_PATH.with_suffix(STAT_PATH.suffix + ".lock")
 TEMPLATE_DIR = Path(__file__).resolve().with_name("templates")
 GITIGNORE_TEMPLATE_NAMES = ["none", "xcode", "python", "web", "node"]
 NO_STAT = False
@@ -1857,10 +1858,80 @@ class FilerApp:
         old_active = self.active_pane
         for index in range(len(self.panes)):
             self.active_pane = index
+            self.ensure_pane_cwd_exists(self.pane)
             self.refresh()
         self.active_pane = old_active
         if restore_focus:
             self.restore_saved_focus()
+
+    def ensure_all_pane_cwds_exist(self) -> bool:
+        changed = False
+        old_active = self.active_pane
+        for index, pane in enumerate(self.panes):
+            self.active_pane = index
+            changed = self.ensure_pane_cwd_exists(pane) or changed
+        self.active_pane = old_active
+        return changed
+
+    def ensure_pane_cwd_exists(self, pane: PaneState) -> bool:
+        if pane.cwd.is_dir():
+            return False
+        fallback = nearest_existing_dir(pane.cwd, Path.cwd())
+        pane.cwd = fallback
+        self.reset_pane_location_state(pane)
+        if pane is self.pane:
+            self.status = f"directory fallback: {fallback}"
+        return True
+
+    def reset_pane_location_state(self, pane: PaneState) -> None:
+        pane.zip_path = None
+        pane.zip_dir = ""
+        pane.search_mode = False
+        pane.search_pattern = ""
+        pane.search_kind = "content"
+        pane.git_history_mode = False
+        pane.git_history_file = None
+        pane.git_status_mode = False
+        pane.git_tree_mode = False
+        pane.git_commit_files_mode = False
+        pane.git_commit_hash = ""
+        pane.git_commit_parent = ""
+        pane.compare_mode = False
+        pane.duplex_mode = False
+        pane.duplex_root = None
+        pane.thuru_return_path = None
+        pane.thuru_preview_path = None
+        pane.cursor = 0
+        pane.top = 0
+        if pane.marks is not None:
+            pane.marks.clear()
+
+    def retarget_panes_after_rename(self, old_path: Path, new_path: Path) -> None:
+        for pane in self.panes:
+            cwd = retarget_path_after_rename(pane.cwd, old_path, new_path)
+            zip_path = retarget_path_after_rename(pane.zip_path, old_path, new_path) if pane.zip_path is not None else None
+            changed = cwd != pane.cwd or zip_path != pane.zip_path
+            if not changed:
+                continue
+            pane.cwd = cwd
+            if zip_path is not None:
+                pane.zip_path = zip_path
+            pane.cursor = 0
+            pane.top = 0
+            if pane.marks is not None:
+                pane.marks.clear()
+
+    def fallback_panes_after_delete(self, deleted_paths: list[Path]) -> None:
+        for pane in self.panes:
+            for deleted in deleted_paths:
+                if path_is_same_or_inside(pane.cwd, deleted):
+                    pane.cwd = nearest_existing_dir(deleted.parent, Path.cwd())
+                    self.reset_pane_location_state(pane)
+                    break
+                if pane.zip_path is not None and path_is_same_or_inside(pane.zip_path, deleted):
+                    pane.cwd = nearest_existing_dir(deleted.parent, Path.cwd())
+                    self.reset_pane_location_state(pane)
+                    break
 
     def reload_current(self, term: Terminal | None = None) -> None:
         if is_thuru_path(self.cwd, self.config.thurupaths):
@@ -1887,6 +1958,9 @@ class FilerApp:
     def idle_watch_tick(self) -> bool:
         if not self.idle_watch_due():
             return False
+        if self.ensure_all_pane_cwds_exist():
+            self.refresh_all()
+            return True
         self.update_watchers()
         self.mark_snapshot_changes_dirty()
         return self.apply_auto_refresh()
@@ -1950,7 +2024,8 @@ class FilerApp:
                 continue
             pane.watch_dirty = False
             if self.watch_target(pane) is None:
-                continue
+                if not self.ensure_pane_cwd_exists(pane):
+                    continue
             self.active_pane = index
             self.refresh()
             changed = True
@@ -2086,6 +2161,7 @@ class FilerApp:
         self.status = f"history: {path}"
 
     def refresh(self) -> None:
+        self.ensure_pane_cwd_exists(self.pane)
         if self.pane.duplex_mode:
             self.entries = list_duplex_entries(self.pane.duplex_root or self.cwd)
         elif self.pane.compare_mode:
@@ -2374,6 +2450,8 @@ class FilerApp:
         elif key == KEY_LEFT and self.mode == "preview":
             self.log_focus = False
             self.pane.preview_focus = False
+        elif key == KEY_CTRL_ENTER:
+            self.open_selected_os()
         elif key == KEY_ENTER:
             if not self.paste_selected_to_log_prompt():
                 self.open_selected(term)
@@ -3159,6 +3237,16 @@ class FilerApp:
             return
         self.status = f"os open: {path.name}"
 
+    def open_selected_os(self) -> None:
+        entry = self.selected()
+        if entry is None or is_owner_entry(entry):
+            self.status = "os open: no file"
+            return
+        if entry.zip_path is not None:
+            self.status = "archive内ファイルのos openは未対応です"
+            return
+        self.open_path_os(entry.path)
+
     def go_parent(self, term: Terminal | None = None) -> None:
         if self.pane.zip_path is not None:
             if self.pane.zip_dir:
@@ -3324,8 +3412,7 @@ class FilerApp:
         else:
             bookmarks.append(CommandItem(title, path))
         EDITOR_STATE.bookmarks = bookmarks
-        save_stat(self.filer_stat())
-        self.status = f"bookmark added: {title}"
+        self.status = f"bookmark added: {title}" if save_stat(self.filer_stat()) else "bookmark save failed"
 
     def bookmark_selected(self, term: Terminal) -> None:
         bookmarks = EDITOR_STATE.bookmarks or []
@@ -3400,12 +3487,14 @@ class FilerApp:
             elif key == KEY_DELETE:
                 del bookmarks[cursor]
                 cursor = min(cursor, max(0, len(bookmarks) - 1))
-                save_stat(self.filer_stat())
+                if not save_stat(self.filer_stat()):
+                    self.status = "bookmark save failed"
             elif key in ("r", "R"):
                 title = self.prompt(term, "bookmark title", bookmarks[cursor].title)
                 if title:
                     bookmarks[cursor].title = title
-                    save_stat(self.filer_stat())
+                    if not save_stat(self.filer_stat()):
+                        self.status = "bookmark save failed"
 
     def launcher_selected(self, term: Terminal) -> None:
         entry = self.selected()
@@ -4548,6 +4637,7 @@ class FilerApp:
         dst = entry.path.with_name(new_name)
         try:
             entry.path.rename(dst)
+            self.retarget_panes_after_rename(entry.path, dst)
             self.status = f"renamed: {entry.path.name} -> {new_name}"
             self.append_log(f"RENAME {entry.path} {dst} (success)")
         except OSError as exc:
@@ -4600,6 +4690,7 @@ class FilerApp:
             for entry, target in targets:
                 if entry.path != target:
                     entry.path.rename(target)
+                    self.retarget_panes_after_rename(entry.path, target)
                     self.append_log(f"RENAME {entry.path} {target} (success)")
             self.status = f"renamed: {len(targets)} item(s)"
             self.clear_marks()
@@ -4647,6 +4738,7 @@ class FilerApp:
         try:
             for entry, target in targets:
                 entry.path.rename(target)
+                self.retarget_panes_after_rename(entry.path, target)
                 self.append_log(f"RENAME {entry.path} {target} (success)")
             self.status = f"replaced: {len(targets)} item(s)"
             self.clear_marks()
@@ -4688,10 +4780,12 @@ class FilerApp:
                     for entry in entries:
                         self.append_live_log(term, f"DELETE {entry_display_path(entry)} (success)")
                 else:
+                    deleted_paths = [entry.path for entry in entries]
                     for entry in entries:
                         self.append_live_log(term, f"DELETE running: {entry.path}")
                         remove_file_target(entry.path)
                         self.append_live_log(term, f"DELETE {entry.path} (success)")
+                    self.fallback_panes_after_delete(deleted_paths)
                 self.status = f"deleted: {len(entries)} item(s)"
                 self.append_live_log(term, self.status)
                 self.clear_marks()
@@ -12223,11 +12317,8 @@ def load_stat() -> None:
     global FILER_STAT
     if NO_STAT:
         return
-    try:
-        data = json.loads(STAT_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(data, dict):
+    data = read_stat_file()
+    if data is None:
         return
     FILER_STAT = data
     EDITOR_STATE.wrap = bool(data.get("wrap", EDITOR_STATE.wrap))
@@ -12250,14 +12341,14 @@ def load_stat() -> None:
         EDITOR_STATE.tab_spaces = tab_spaces
 
 
-def save_stat(filer: dict[str, object] | None = None) -> None:
+def save_stat(filer: dict[str, object] | None = None) -> bool:
     global FILER_STAT
     if NO_STAT:
-        return
+        return True
     if filer is None:
         old = FILER_STAT.get("filer")
         filer = old if isinstance(old, dict) else None
-    data = {
+    local_data = {
         "wrap": EDITOR_STATE.wrap,
         "line_numbers": EDITOR_STATE.line_numbers,
         "show_datetime": EDITOR_STATE.show_datetime,
@@ -12276,12 +12367,134 @@ def save_stat(filer: dict[str, object] | None = None) -> None:
         "replace_history": (EDITOR_STATE.replace_history or [])[-50:],
     }
     if filer is not None:
-        data["filer"] = filer
-    FILER_STAT = data
+        local_data["filer"] = filer
     try:
-        STAT_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        with StatWriteLock(STAT_LOCK_PATH):
+            disk_data = read_stat_file() or {}
+            data = merge_stat_data(FILER_STAT, disk_data, local_data)
+            write_stat_file(data)
+            FILER_STAT = data
+            EDITOR_STATE.bookmarks = load_bookmarks(data.get("bookmarks"))
+            return True
     except OSError:
-        pass
+        return False
+
+
+def read_stat_file() -> dict[str, object] | None:
+    try:
+        data = json.loads(STAT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_stat_file(data: dict[str, object]) -> None:
+    STAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=STAT_PATH.parent, prefix=STAT_PATH.name + ".", suffix=".tmp", delete=False) as handle:
+        tmp_path = Path(handle.name)
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+    try:
+        tmp_path.replace(STAT_PATH)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+class StatWriteLock:
+    def __init__(self, path: Path, timeout: float = 1.0, stale_after: float = 10.0) -> None:
+        self.path = path
+        self.timeout = timeout
+        self.stale_after = stale_after
+        self.fd: int | None = None
+
+    def __enter__(self) -> "StatWriteLock":
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(self.fd, f"{os.getpid()}\n{time.time()}\n".encode("ascii", errors="replace"))
+                return self
+            except FileExistsError:
+                self.remove_stale_lock()
+                if time.monotonic() >= deadline:
+                    raise OSError(f"stat lock timeout: {self.path}")
+                time.sleep(0.02)
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            finally:
+                self.fd = None
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+    def remove_stale_lock(self) -> None:
+        try:
+            stat_result = self.path.stat()
+        except OSError:
+            return
+        if time.time() - stat_result.st_mtime <= self.stale_after:
+            return
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def merge_stat_data(base: dict[str, object], remote: dict[str, object], local: dict[str, object]) -> dict[str, object]:
+    data = dict(remote)
+    for key, value in local.items():
+        if key in ("bookmarks", "find_history", "replace_history"):
+            continue
+        data[key] = value
+    data["bookmarks"] = dump_bookmarks(merge_bookmarks(load_bookmarks(base.get("bookmarks")), load_bookmarks(remote.get("bookmarks")), load_bookmarks(local.get("bookmarks"))))
+    data["find_history"] = merge_string_history(load_string_list(remote.get("find_history")), load_string_list(local.get("find_history")), 50)
+    data["replace_history"] = merge_string_history(load_string_list(remote.get("replace_history")), load_string_list(local.get("replace_history")), 50)
+    return data
+
+
+def dump_bookmarks(items: list[CommandItem]) -> list[dict[str, str]]:
+    return [{"title": item.title, "path": item.command} for item in items]
+
+
+def bookmark_key(item: CommandItem) -> tuple[str, str]:
+    return item.title, item.command
+
+
+def merge_bookmarks(base: list[CommandItem], remote: list[CommandItem], local: list[CommandItem]) -> list[CommandItem]:
+    local_keys = {bookmark_key(item) for item in local}
+    deleted_keys = {bookmark_key(item) for item in base if bookmark_key(item) not in local_keys}
+    result: list[CommandItem] = []
+    seen: set[tuple[str, str]] = set()
+    for item in remote:
+        key = bookmark_key(item)
+        if key in deleted_keys or key in seen:
+            continue
+        result.append(item)
+        seen.add(key)
+    for item in local:
+        key = bookmark_key(item)
+        if key in seen:
+            continue
+        result.append(item)
+        seen.add(key)
+    return result
+
+
+def merge_string_history(remote: list[str], local: list[str], limit: int) -> list[str]:
+    values: list[str] = []
+    for item in remote + local:
+        if item in values:
+            values.remove(item)
+        values.append(item)
+    return values[-limit:]
 
 
 def load_bookmarks(value: object) -> list[CommandItem]:
@@ -12345,6 +12558,36 @@ def same_existing_path(left: Path, right: Path) -> bool:
         return left.resolve() == right.resolve()
     except OSError:
         return False
+
+
+def path_is_same_or_inside(path: Path, base: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(base.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def retarget_path_after_rename(path: Path, old_path: Path, new_path: Path) -> Path:
+    try:
+        rel = path.resolve(strict=False).relative_to(old_path.resolve(strict=False))
+    except ValueError:
+        return path
+    return new_path / rel
+
+
+def nearest_existing_dir(path: Path, fallback: Path) -> Path:
+    target = path.expanduser()
+    while True:
+        if target.is_dir():
+            return target.resolve()
+        parent = target.parent
+        if parent == target:
+            break
+        target = parent
+    if fallback.is_dir():
+        return fallback.resolve()
+    return Path.cwd().resolve()
 
 
 def is_path_inside(path: Path, base: Path) -> bool:
@@ -12845,6 +13088,22 @@ def default_editor() -> str:
 
 
 def run_self_test() -> None:
+    global NO_STAT, FILER_STAT, EDITOR_STATE
+    old_no_stat = NO_STAT
+    old_filer_stat = dict(FILER_STAT)
+    old_editor_state = EDITOR_STATE
+    NO_STAT = True
+    FILER_STAT = {}
+    EDITOR_STATE = EditorState([], [])
+    try:
+        run_self_test_body()
+    finally:
+        EDITOR_STATE = old_editor_state
+        FILER_STAT = old_filer_stat
+        NO_STAT = old_no_stat
+
+
+def run_self_test_body() -> None:
     assert fit("abc", 5) == "abc  "
     assert display_width("abc") == 3
     assert detect_eol(b"a\nb\n") == "LF"
@@ -12906,6 +13165,40 @@ def run_self_test() -> None:
     assert entry_is_image(Entry(Path("test.zip"), "a.png", False, 0, Path("test.zip"), "dir/a.png"))
     seq = iterm_image_sequence("a.png", b"\x89PNG")
     assert seq.startswith("\x1b]1337;File=") and "width=100%;height=100%" in seq and seq.endswith("\x07")
+    old_stat_path = STAT_PATH
+    old_stat_lock_path = STAT_LOCK_PATH
+    old_no_stat = NO_STAT
+    old_stat_data = dict(FILER_STAT)
+    old_bookmarks = EDITOR_STATE.bookmarks
+    try:
+        with tempfile.TemporaryDirectory() as stat_temp:
+            stat_root = Path(stat_temp)
+            globals()["STAT_PATH"] = stat_root / "vfiler_stat.json"
+            globals()["STAT_LOCK_PATH"] = stat_root / "vfiler_stat.json.lock"
+            globals()["NO_STAT"] = False
+            globals()["FILER_STAT"] = {}
+            EDITOR_STATE.bookmarks = [CommandItem("one", "/one")]
+            assert save_stat({"mode": "dual"})
+            globals()["FILER_STAT"] = {}
+            EDITOR_STATE.bookmarks = []
+            assert save_stat({"mode": "preview"})
+            saved = read_stat_file() or {}
+            assert load_bookmarks(saved.get("bookmarks")) == [CommandItem("one", "/one")]
+            one = {"title": "one", "path": "/one"}
+            two = {"title": "two", "path": "/two"}
+            three = {"title": "three", "path": "/three"}
+            globals()["FILER_STAT"] = {"bookmarks": [one, two]}
+            write_stat_file({"bookmarks": [one, two, three]})
+            EDITOR_STATE.bookmarks = [CommandItem("two", "/two")]
+            assert save_stat()
+            saved = read_stat_file() or {}
+            assert load_bookmarks(saved.get("bookmarks")) == [CommandItem("two", "/two"), CommandItem("three", "/three")]
+    finally:
+        globals()["STAT_PATH"] = old_stat_path
+        globals()["STAT_LOCK_PATH"] = old_stat_lock_path
+        globals()["NO_STAT"] = old_no_stat
+        globals()["FILER_STAT"] = old_stat_data
+        EDITOR_STATE.bookmarks = old_bookmarks
     parsed_commands = parse_command_items([{"title": "tool", "command": "run", "char": "cp932", "screen": "fullscreen"}])
     assert len(parsed_commands) == 1
     assert parsed_commands[0].charset == "cp932"
@@ -12977,6 +13270,10 @@ def run_self_test() -> None:
     assert resident_response_needs_restart({"ok": False, "error": "(5, 'Input/output error')"}) is True
     assert resident_response_needs_restart({"ok": False, "error": "[Errno 5] Input/output error"}) is True
     assert resident_response_needs_restart({"ok": False, "error": "buffer not found"}) is False
+    assert resident_tty_path_from_id("dev_ttys000") == Path("/dev/ttys000")
+    assert resident_terminal_alive("dev_vfiler_missing_tty_for_test") is False
+    ps_text = " 123 python /Users/kds/Projects/2sfd/vfiler.py --z-server dev_ttys000\n 456 grep vfiler\n 789 python vfiler.py --z-server dev_ttys001\n"
+    assert parse_resident_server_pids(ps_text, "dev_ttys000") == [123]
     with tempfile.TemporaryDirectory() as resident_temp:
         resident_root = Path(resident_temp)
         resident_other = resident_root / "other"
@@ -13020,6 +13317,23 @@ def run_self_test() -> None:
         watch_app.mark_snapshot_changes_dirty()
         assert watch_app.pane.watch_dirty is True
         assert watch_app.apply_auto_refresh() is True
+    with tempfile.TemporaryDirectory() as shell_temp:
+        shell_root = Path(shell_temp)
+        shell_child = shell_root / "child"
+        shell_child.mkdir()
+        shell_app = FilerApp(shell_child, restore_stat=False)
+        shell_app.refresh()
+        shutil.rmtree(shell_child)
+        shell_app.last_input_time -= 2
+        assert shell_app.idle_watch_tick() is True
+        assert same_existing_path(shell_app.cwd, shell_root)
+        shell_renamed = shell_root / "renamed"
+        shell_renamed.mkdir()
+        shell_app.cwd = shell_renamed
+        shell_app.refresh()
+        shell_renamed.rename(shell_root / "renamed2")
+        shell_app.refresh()
+        assert same_existing_path(shell_app.cwd, shell_root)
     old_windows = IS_WINDOWS
     try:
         globals()["IS_WINDOWS"] = True
@@ -13059,6 +13373,49 @@ def run_self_test() -> None:
     assert restored_size_app.panes[0].preview_ratio == 0.44
     assert restored_size_app.panes[1].preview_ratio == 0.66
     assert restored_size_app.panes[0].sort_key == "natural"
+    with tempfile.TemporaryDirectory() as pane_temp:
+        pane_root = Path(pane_temp)
+        left_dir = pane_root / "left"
+        right_dir = pane_root / "right"
+        right_child = right_dir / "child"
+        left_dir.mkdir()
+        right_child.mkdir(parents=True)
+        pane_app = FilerApp(left_dir, right_child, restore_stat=False)
+        pane_app.refresh_all()
+        rename_entry = Entry(right_dir, "right", True, 0)
+        original_prompt = pane_app.prompt
+        pane_app.prompt = lambda *_args, **_kwargs: "renamed"  # type: ignore[method-assign]
+        try:
+            pane_app.rename_one(object(), rename_entry)  # type: ignore[arg-type]
+        finally:
+            pane_app.prompt = original_prompt  # type: ignore[method-assign]
+        assert same_existing_path(pane_app.panes[1].cwd, pane_root / "renamed" / "child")
+        delete_target = pane_root / "renamed"
+        pane_app.fallback_panes_after_delete([delete_target])
+        assert same_existing_path(pane_app.panes[1].cwd, pane_root)
+        assert pane_app.panes[1].zip_path is None
+        missing = pane_root / "missing" / "nested"
+        assert same_existing_path(stat_path(str(missing), left_dir), pane_root)
+    with tempfile.TemporaryDirectory() as os_open_temp:
+        os_open_root = Path(os_open_temp)
+        os_open_file = os_open_root / "open.txt"
+        os_open_file.write_text("open", encoding="utf-8")
+        os_open_app = FilerApp(os_open_root, restore_stat=False)
+        os_open_app.refresh()
+        os_open_app.cursor = next(index for index, entry in enumerate(os_open_app.entries) if entry.name == "open.txt")
+        opened_paths: list[Path] = []
+        original_open_path_os = os_open_app.open_path_os
+        os_open_app.open_path_os = lambda path: opened_paths.append(path)  # type: ignore[method-assign]
+        try:
+            os_open_app.handle_key(object(), KEY_CTRL_ENTER)  # type: ignore[arg-type]
+        finally:
+            os_open_app.open_path_os = original_open_path_os  # type: ignore[method-assign]
+        assert len(opened_paths) == 1 and same_existing_path(opened_paths[0], os_open_file)
+        os_open_app.entries = [Entry(os_open_file, "inside.txt", False, 4, os_open_root / "archive.zip", "inside.txt")]
+        os_open_app.pane.entries = os_open_app.entries
+        os_open_app.cursor = 0
+        os_open_app.open_selected_os()
+        assert os_open_app.status == "archive内ファイルのos openは未対応です"
     mark_app = FilerApp(Path("."), restore_stat=False)
     mark_app.entries = [Entry(Path("a.txt"), "a.txt", False, 1), Entry(Path("b.txt"), "b.txt", False, 1)]
     mark_app.pane.entries = mark_app.entries
@@ -13555,6 +13912,9 @@ def stat_path(value: object, fallback: Path) -> Path:
         path = Path(value).expanduser()
         if path.is_dir():
             return path
+        parent = nearest_existing_dir(path.parent, fallback)
+        if parent.is_dir():
+            return parent
     return fallback
 
 
@@ -13580,8 +13940,9 @@ def git_status_title(kind: str) -> str:
 
 
 class ResidentServer:
-    def __init__(self, socket_path: Path) -> None:
+    def __init__(self, socket_path: Path, tty_id: str | None = None) -> None:
         self.socket_path = socket_path
+        self.tty_id = tty_id
         self.stop_event = threading.Event()
         self.editor: EditorSession | None = None
         self.filer: FilerApp | None = None
@@ -13598,6 +13959,9 @@ class ResidentServer:
         server.settimeout(0.2)
         try:
             while not self.stop_event.is_set():
+                if not resident_terminal_alive(self.tty_id):
+                    self.stop_event.set()
+                    break
                 try:
                     conn, _ = server.accept()
                 except socket.timeout:
@@ -13755,6 +14119,27 @@ def resident_pid_path(tty_id: str | None = None) -> Path:
     return Path(tempfile.gettempdir()) / f"vfiler-z-{os.getuid()}-{tty_id or resident_tty_id()}.pid"
 
 
+def resident_tty_path_from_id(tty_id: str | None) -> Path | None:
+    if not tty_id or tty_id == "notty":
+        return None
+    if tty_id.startswith("dev_"):
+        return Path("/" + tty_id.replace("_", "/", 1))
+    return None
+
+
+def resident_terminal_alive(tty_id: str | None) -> bool:
+    if IS_WINDOWS or not tty_id:
+        return True
+    tty_path = resident_tty_path_from_id(tty_id)
+    if tty_path is not None and not tty_path.exists():
+        return False
+    try:
+        os.tcgetpgrp(sys.stdin.fileno())
+    except (OSError, termios.error):
+        return False
+    return True
+
+
 def resident_server_alive(socket_path: Path) -> bool:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(0.1)
@@ -13782,21 +14167,58 @@ def resident_pid(tty_id: str | None = None) -> int | None:
         return None
 
 
+def resident_server_pids(tty_id: str | None = None) -> list[int]:
+    target = tty_id or resident_tty_id()
+    pids: set[int] = set()
+    pid = resident_pid(target)
+    if pid is not None:
+        pids.add(pid)
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,args="], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", check=False)
+    except OSError:
+        return sorted(pid for pid in pids if pid != os.getpid())
+    if result.returncode == 0:
+        pids.update(parse_resident_server_pids(result.stdout, target))
+    return sorted(pid for pid in pids if pid != os.getpid())
+
+
+def parse_resident_server_pids(text: str, tty_id: str) -> list[int]:
+    pids: list[int] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, args = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if "vfiler.py" not in args or "--z-server" not in args:
+            continue
+        parts = shlex.split(args)
+        for index, part in enumerate(parts):
+            if part == "--z-server" and index + 1 < len(parts) and parts[index + 1] == tty_id:
+                pids.append(pid)
+                break
+    return pids
+
+
 def stop_resident_server(tty_id: str | None = None) -> None:
-    pid = resident_pid(tty_id)
-    if pid is None:
+    pids = resident_server_pids(tty_id)
+    if not pids:
         cleanup_resident_files(tty_id)
         return
     for sig, deadline in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 0.5)):
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            break
-        except OSError:
-            break
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                continue
         end = time.monotonic() + deadline
         while time.monotonic() < end:
-            if resident_pid_dead(pid):
+            if all(resident_pid_dead(pid) for pid in pids):
                 cleanup_resident_files(tty_id)
                 return
             time.sleep(0.05)
@@ -13823,7 +14245,7 @@ def run_resident_server(tty_id: str | None = None) -> int:
     pid_path = resident_pid_path(tty_id)
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     try:
-        ResidentServer(resident_socket_path(tty_id)).serve()
+        ResidentServer(resident_socket_path(tty_id), tty_id).serve()
     finally:
         try:
             pid_path.unlink(missing_ok=True)
@@ -13840,7 +14262,10 @@ def run_resident_mode() -> int:
         if response.get("ok") and response.get("protocol") == RESIDENT_PROTOCOL:
             return 0
         stop_resident_server(tty_id)
-    cleanup_resident_files(tty_id)
+    elif resident_server_pids(tty_id):
+        stop_resident_server(tty_id)
+    else:
+        cleanup_resident_files(tty_id)
     try:
         tty_in = open("/dev/tty", "rb", buffering=0)
         tty_out = open("/dev/tty", "wb", buffering=0)
