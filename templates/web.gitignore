@@ -1,0 +1,14 @@
+.DS_Store
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+.cache/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
